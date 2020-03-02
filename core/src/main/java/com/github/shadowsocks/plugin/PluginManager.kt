@@ -24,23 +24,34 @@ import android.annotation.SuppressLint
 import android.content.BroadcastReceiver
 import android.content.ContentResolver
 import android.content.Intent
+import android.content.pm.ComponentInfo
 import android.content.pm.PackageManager
+import android.content.pm.ProviderInfo
 import android.content.pm.Signature
+import android.database.Cursor
 import android.net.Uri
+import android.system.Os
 import android.util.Base64
 import android.util.Log
 import androidx.core.os.bundleOf
 import com.crashlytics.android.Crashlytics
 import com.github.shadowsocks.Core
 import com.github.shadowsocks.Core.app
-import com.github.shadowsocks.utils.Commandline
+import com.github.shadowsocks.bg.BaseService
+import com.github.shadowsocks.utils.listenForPackageChanges
 import com.github.shadowsocks.utils.printLog
 import com.github.shadowsocks.utils.signaturesCompat
-import eu.chainfire.libsuperuser.Shell
 import java.io.File
 import java.io.FileNotFoundException
 
 object PluginManager {
+    private const val TAG = "PluginManager"
+
+    class PluginNotFoundException(private val plugin: String) : FileNotFoundException(plugin),
+            BaseService.ExpectedException {
+        override fun getLocalizedMessage() = app.getString(com.github.shadowsocks.core.R.string.plugin_unknown, plugin)
+    }
+
     /**
      * Trusted signatures by the app. Third-party fork should add their public key to their fork if the developer wishes
      * to publish or has published plugins for this app. You can obtain your public key by executing:
@@ -90,19 +101,15 @@ object PluginManager {
     }
 
     private var receiver: BroadcastReceiver? = null
-    private var cachedPlugins: Map<String, Plugin>? = null
-    fun fetchPlugins(): Map<String, Plugin> = synchronized(this) {
-        if (receiver == null) receiver = Core.listenForPackageChanges {
+    private var cachedPlugins: PluginList? = null
+    fun fetchPlugins() = synchronized(this) {
+        if (receiver == null) receiver = app.listenForPackageChanges {
             synchronized(this) {
                 receiver = null
                 cachedPlugins = null
             }
         }
-        if (cachedPlugins == null) {
-            val pm = app.packageManager
-            cachedPlugins = (pm.queryIntentContentProviders(Intent(PluginContract.ACTION_NATIVE_PLUGIN),
-                    PackageManager.GET_META_DATA).map { NativePlugin(it) } + NoPlugin).associate { it.id to it }
-        }
+        if (cachedPlugins == null) cachedPlugins = PluginList()
         cachedPlugins!!
     }
 
@@ -115,54 +122,78 @@ object PluginManager {
 
     // the following parts are meant to be used by :bg
     @Throws(Throwable::class)
-    fun init(options: PluginOptions): String? {
-        if (options.id.isEmpty()) return null
+    fun init(configuration: PluginConfiguration): Pair<String, PluginOptions>? {
+        if (configuration.selected.isEmpty()) return null
         var throwable: Throwable? = null
 
         try {
-            val path = initNative(options)
-            if (path != null) return path
+            val result = initNative(configuration)
+            if (result != null) return result
         } catch (t: Throwable) {
             if (throwable == null) throwable = t else printLog(t)
         }
 
         // add other plugin types here
 
-        throw throwable
-                ?: FileNotFoundException(app.getString(com.github.shadowsocks.core.R.string.plugin_unknown, options.id))
+        throw throwable ?: PluginNotFoundException(configuration.selected)
     }
 
-    private fun initNative(options: PluginOptions): String? {
+    private fun initNative(configuration: PluginConfiguration): Pair<String, PluginOptions>? {
         val providers = app.packageManager.queryIntentContentProviders(
-                Intent(PluginContract.ACTION_NATIVE_PLUGIN, buildUri(options.id)), 0)
+                Intent(PluginContract.ACTION_NATIVE_PLUGIN, buildUri(configuration.selected)),
+                PackageManager.GET_META_DATA or
+                        PackageManager.MATCH_DIRECT_BOOT_UNAWARE or PackageManager.MATCH_DIRECT_BOOT_AWARE
+        )
         if (providers.isEmpty()) return null
-        val uri = Uri.Builder()
-                .scheme(ContentResolver.SCHEME_CONTENT)
-                .authority(providers.single().providerInfo.authority)
-                .build()
-        val cr = app.contentResolver
-        return try {
-            initNativeFast(cr, options, uri)
+        val provider = providers.single().providerInfo
+        val options = configuration.getOptions { provider.loadString(PluginContract.METADATA_KEY_DEFAULT_CONFIG) }
+        var failure: Throwable? = null
+        try {
+            initNativeFaster(provider)?.also { return it to options }
         } catch (t: Throwable) {
-            Crashlytics.log(Log.WARN, "PluginManager",
-                    "Initializing native plugin fast mode failed. Falling back to slow mode.")
-            printLog(t)
-            initNativeSlow(cr, options, uri)
+            Crashlytics.log(Log.WARN, TAG, "Initializing native plugin faster mode failed")
+            failure = t
+        }
+
+        val uri = Uri.Builder().apply {
+            scheme(ContentResolver.SCHEME_CONTENT)
+            authority(provider.authority)
+        }.build()
+        try {
+            return initNativeFast(app.contentResolver, options, uri)?.let { it to options }
+        } catch (t: Throwable) {
+            Crashlytics.log(Log.WARN, TAG, "Initializing native plugin fast mode failed")
+            failure?.also { t.addSuppressed(it) }
+            failure = t
+        }
+
+        try {
+            return initNativeSlow(app.contentResolver, options, uri)?.let { it to options }
+        } catch (t: Throwable) {
+            failure?.also { t.addSuppressed(it) }
+            throw t
         }
     }
 
-    private fun initNativeFast(cr: ContentResolver, options: PluginOptions, uri: Uri): String {
-        val result = cr.call(uri, PluginContract.METHOD_GET_EXECUTABLE, null,
-                bundleOf(Pair(PluginContract.EXTRA_OPTIONS, options.id)))!!.getString(PluginContract.EXTRA_ENTRY)!!
-        check(File(result).canExecute())
-        return result
+    private fun initNativeFaster(provider: ProviderInfo): String? {
+        return provider.loadString(PluginContract.METADATA_KEY_EXECUTABLE_PATH)?.let { relativePath ->
+            File(provider.applicationInfo.nativeLibraryDir).resolve(relativePath).apply {
+                check(canExecute())
+            }.absolutePath
+        }
+    }
+
+    private fun initNativeFast(cr: ContentResolver, options: PluginOptions, uri: Uri): String? {
+        return cr.call(uri, PluginContract.METHOD_GET_EXECUTABLE, null,
+                bundleOf(PluginContract.EXTRA_OPTIONS to options.id))?.getString(PluginContract.EXTRA_ENTRY)?.also {
+            check(File(it).canExecute())
+        }
     }
 
     @SuppressLint("Recycle")
     private fun initNativeSlow(cr: ContentResolver, options: PluginOptions, uri: Uri): String? {
         var initialized = false
         fun entryNotFound(): Nothing = throw IndexOutOfBoundsException("Plugin entry binary not found")
-        val list = ArrayList<String>()
         val pluginDir = File(Core.deviceStorage.noBackupFilesDir, "plugin")
         (cr.query(uri, arrayOf(PluginContract.COLUMN_PATH, PluginContract.COLUMN_MODE), null, null, null)
                 ?: return null).use { cursor ->
@@ -177,12 +208,22 @@ object PluginManager {
                 cr.openInputStream(uri.buildUpon().path(path).build())!!.use { inStream ->
                     file.outputStream().use { outStream -> inStream.copyTo(outStream) }
                 }
-                list += Commandline.toString(arrayOf("chmod", cursor.getString(1), file.absolutePath))
+                Os.chmod(file.absolutePath, when (cursor.getType(1)) {
+                    Cursor.FIELD_TYPE_INTEGER -> cursor.getInt(1)
+                    Cursor.FIELD_TYPE_STRING -> cursor.getString(1).toInt(8)
+                    else -> throw IllegalArgumentException("File mode should be of type int")
+                })
                 if (path == options.id) initialized = true
             } while (cursor.moveToNext())
         }
         if (!initialized) entryNotFound()
-        Shell.SH.run(list)
         return File(pluginDir, options.id).absolutePath
+    }
+
+    fun ComponentInfo.loadString(key: String) = when (val value = metaData.get(key)) {
+        is String -> value
+        is Int -> app.packageManager.getResourcesForApplication(applicationInfo).getString(value)
+        null -> null
+        else -> error("meta-data $key has invalid type ${value.javaClass}")
     }
 }
